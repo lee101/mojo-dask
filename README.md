@@ -99,7 +99,7 @@ Collections are lazy. Pass `scheduler="synchronous"` to `.compute()` for determi
 single-threaded graph execution or leave the default thread scheduler to run independent
 blocks concurrently. Matrix multiplication uses the CPU by default. The optional
 `da.matmul(left, right, device="gpu")` path uses a compatible accelerator when available
-and emits a runtime warning before falling back to CPU if GPU setup or execution fails.
+and falls back to CPU silently if GPU memory, setup, or execution is unavailable.
 
 ## Benchmarks
 
@@ -113,13 +113,13 @@ Software: Python 3.13.14, NumPy 2.5.1, Dask 2026.7.1.
 
 | kernel | mojo-dask | upstream Dask | Mojo speedup |
 | --- | ---: | ---: | ---: |
-| elementwise `(x + 1.5) * x`, 5M | 44.58 ms | 46.25 ms | 1.04x |
-| mean + variance, 5M | 9.04 ms | 25.16 ms | 2.78x |
-| dot, 5M | 10.58 ms | 25.56 ms | 2.42x |
-| blocked matmul, 768x768 | 28.54 ms | 19.65 ms | 0.69x |
-| blocked matmul GPU, 768x768 | 15.92 ms | 26.29 ms | 1.65x |
-| dataframe mean, 2M x 3 | 35.57 ms | 51.86 ms | 1.46x |
-| groupby mean, 2M / 100 groups | 40.57 ms | 129.74 ms | 3.20x |
+| elementwise `(x + 1.5) * x`, 5M | 9.01 ms | 154.32 ms | 17.13x |
+| mean + variance, 5M | 8.25 ms | 38.29 ms | 4.64x |
+| dot, 5M | 11.58 ms | 39.90 ms | 3.45x |
+| blocked matmul, 768x768 | 22.77 ms | 23.58 ms | 1.04x |
+| blocked matmul GPU, 768x768 | 9.57 ms | 26.27 ms | 2.75x |
+| dataframe mean, 2M x 3 | 37.44 ms | 60.05 ms | 1.60x |
+| groupby mean, 2M / 100 groups | 30.39 ms | 124.49 ms | 4.10x |
 
 The benchmark only attempts GPU work when `nvidia-smi` reports at least 4000 MiB free.
 Otherwise it prints that the GPU row was skipped. Runtime device allocations are capped
@@ -150,11 +150,13 @@ Mojo can dereference them. There is no cross-language allocator.
 
 Array blocks use row-major `float64` storage. Elementwise, sum, dot, and Welford
 reduction loops use the host's native SIMD width with scalar remainder loops.
-Scalar-then-binary elementwise pairs execute in one kernel and one output allocation.
+Large scalar-then-binary elementwise pairs execute as parallel fused block writes into
+disjoint slices of one output allocation, avoiding intermediate and assembly copies.
 Whole-array reductions at or above one million elements schedule independent block
 statistics in parallel; smaller reductions stay serial. Matrix block products
-accumulate directly into caller-owned output buffers instead of allocating intermediate
-products.
+run independently above an arithmetic-work threshold and accumulate in place; smaller
+products stay serial. The CPU microkernel holds a four-row by two-SIMD-vector tile in
+registers across the inner dimension and uses scalar remainder loops.
 
 Reductions compute mergeable Welford `(count, sum, mean, M2, min, max)` states.
 Dataframe partitions factorize group keys in Python, aggregate numeric columns by
@@ -166,7 +168,7 @@ their arithmetic intensity is too low to repay device transfers.
 
 ## Verification
 
-The pytest suite contains 95 tests. It asserts values, chunk layouts, NaN behavior,
+The pytest suite contains 105 tests. It asserts values, chunk layouts, NaN behavior,
 degrees of freedom, index/order behavior, and result dtypes against real upstream Dask
 and pandas rather than merely checking that calls complete.
 

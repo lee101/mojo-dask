@@ -97,6 +97,19 @@ def test_fused_elementwise_simd_tails(size):
     )
 
 
+def test_large_fused_elementwise_parallel_writes_and_tails():
+    values = rng.normal(size=1_000_003)
+    ours = da.from_array(values, chunks=200_001)
+    result = (ours + 1.5) * ours
+    assert any(key.startswith("fused-write-") for key in result._graph)
+    np.testing.assert_allclose(
+        result.compute(),
+        (values + 1.5) * values,
+        rtol=1e-13,
+        atol=1e-13,
+    )
+
+
 @pytest.mark.parametrize("name", ["sum", "mean", "var", "std", "min", "max"])
 def test_whole_array_reduction_parity(matrix, name):
     ours = da.from_array(matrix, chunks=(7, 5))
@@ -211,6 +224,37 @@ def test_blocked_matmul_matches_dask():
     np.testing.assert_allclose(ours.compute(), theirs.compute(), rtol=1e-12, atol=1e-12)
 
 
+@pytest.mark.parametrize("size", [1, 3, 4, 5, 15, 16, 17])
+def test_inplace_add_simd_tails(size):
+    left = rng.normal(size=size)
+    right = rng.normal(size=size)
+    expected = left + right
+    _lib.add_inplace(left, right)
+    np.testing.assert_allclose(left, expected, rtol=1e-13, atol=1e-13)
+
+
+def test_matmul_parallel_threshold_and_simd_tails():
+    small_a = rng.normal(size=(99, 200))
+    shared_b = rng.normal(size=(200, 200))
+    small = da.from_array(small_a, chunks=(50, 100)) @ da.from_array(
+        shared_b, chunks=(100, 100)
+    )
+    assert any(key.startswith("matmul-serial-") for key in small._graph)
+    assert not any(key.startswith("matmul-product-") for key in small._graph)
+    np.testing.assert_allclose(
+        small.compute(), small_a @ shared_b, rtol=1e-12, atol=1e-12
+    )
+
+    large_a = rng.normal(size=(100, 200))
+    large = da.from_array(large_a, chunks=(50, 100)) @ da.from_array(
+        shared_b, chunks=(100, 100)
+    )
+    assert any(key.startswith("matmul-product-") for key in large._graph)
+    np.testing.assert_allclose(
+        large.compute(), large_a @ shared_b, rtol=1e-12, atol=1e-12
+    )
+
+
 def test_gpu_matmul_or_cpu_fallback_matches_dask():
     a = rng.normal(size=(17, 13))
     b = rng.normal(size=(13, 11))
@@ -224,6 +268,25 @@ def test_gpu_matmul_or_cpu_fallback_matches_dask():
     )
     np.testing.assert_allclose(
         ours.compute(), theirs.compute(), rtol=1e-12, atol=1e-12
+    )
+
+
+def test_gpu_low_memory_falls_back_silently(monkeypatch):
+    monkeypatch.setattr(_lib, "_gpu_memory_cache", None)
+    monkeypatch.setattr(_lib, "_gpu_memory_free_mib", lambda: 3999)
+    library = _lib.lib()
+
+    def unexpected_gpu_call(*args):
+        raise AssertionError("GPU kernel must not run below the memory threshold")
+
+    monkeypatch.setattr(library, "md_matmul_gpu", unexpected_gpu_call)
+    left = rng.normal(size=(9, 7))
+    right = rng.normal(size=(7, 5))
+    np.testing.assert_allclose(
+        _lib.matmul(left, right, device="gpu"),
+        left @ right,
+        rtol=1e-12,
+        atol=1e-12,
     )
 
 

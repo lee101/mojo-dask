@@ -265,6 +265,22 @@ def md_dot(a_addr: Int, b_addr: Int, n: Int) abi("C") -> Float64:
     return total
 
 
+@export("md_add_inplace")
+def md_add_inplace(dst_addr: Int, a_addr: Int, n: Int) abi("C"):
+    var dst = fp(dst_addr)
+    var a = fp(a_addr)
+    var i = 0
+    while i + W <= n:
+        dst.unsafe_store(
+            i,
+            dst.unsafe_load[width=W](i) + a.unsafe_load[width=W](i),
+        )
+        i += W
+    while i < n:
+        dst[unsafe_offset=i] += a[unsafe_offset=i]
+        i += 1
+
+
 @export("md_matmul")
 def md_matmul(
     a_addr: Int,
@@ -278,24 +294,116 @@ def md_matmul(
     var a = fp(a_addr)
     var b = fp(b_addr)
     var dst = fp(dst_addr)
-    if accumulate == 0:
-        for i in range(rows * cols):
-            dst[unsafe_offset=i] = 0.0
-    for i in range(rows):
-        for k in range(inner):
-            var av = a[unsafe_offset=i * inner + k]
-            var j = 0
-            var vv = SIMD[DType.float64, W](av)
-            while j + W <= cols:
-                dst.unsafe_store(
-                    i * cols + j,
-                    dst.unsafe_load[width=W](i * cols + j)
-                    + vv * b.unsafe_load[width=W](k * cols + j),
-                )
-                j += W
-            while j < cols:
-                dst[unsafe_offset=i * cols + j] += av * b[unsafe_offset=k * cols + j]
-                j += 1
+    var i = 0
+    while i + 4 <= rows:
+        var j = 0
+        while j + 2 * W <= cols:
+            var offset0 = i * cols + j
+            var offset1 = offset0 + cols
+            var offset2 = offset1 + cols
+            var offset3 = offset2 + cols
+            var acc00 = SIMD[DType.float64, W](0.0)
+            var acc01 = SIMD[DType.float64, W](0.0)
+            var acc10 = SIMD[DType.float64, W](0.0)
+            var acc11 = SIMD[DType.float64, W](0.0)
+            var acc20 = SIMD[DType.float64, W](0.0)
+            var acc21 = SIMD[DType.float64, W](0.0)
+            var acc30 = SIMD[DType.float64, W](0.0)
+            var acc31 = SIMD[DType.float64, W](0.0)
+            if accumulate != 0:
+                acc00 = dst.unsafe_load[width=W](offset0)
+                acc01 = dst.unsafe_load[width=W](offset0 + W)
+                acc10 = dst.unsafe_load[width=W](offset1)
+                acc11 = dst.unsafe_load[width=W](offset1 + W)
+                acc20 = dst.unsafe_load[width=W](offset2)
+                acc21 = dst.unsafe_load[width=W](offset2 + W)
+                acc30 = dst.unsafe_load[width=W](offset3)
+                acc31 = dst.unsafe_load[width=W](offset3 + W)
+            for k in range(inner):
+                var b_offset = k * cols + j
+                var bv0 = b.unsafe_load[width=W](b_offset)
+                var bv1 = b.unsafe_load[width=W](b_offset + W)
+                var av0 = SIMD[DType.float64, W](a[unsafe_offset=i * inner + k])
+                var av1 = SIMD[DType.float64, W](a[unsafe_offset=(i + 1) * inner + k])
+                var av2 = SIMD[DType.float64, W](a[unsafe_offset=(i + 2) * inner + k])
+                var av3 = SIMD[DType.float64, W](a[unsafe_offset=(i + 3) * inner + k])
+                acc00 += av0 * bv0
+                acc01 += av0 * bv1
+                acc10 += av1 * bv0
+                acc11 += av1 * bv1
+                acc20 += av2 * bv0
+                acc21 += av2 * bv1
+                acc30 += av3 * bv0
+                acc31 += av3 * bv1
+            dst.unsafe_store(offset0, acc00)
+            dst.unsafe_store(offset0 + W, acc01)
+            dst.unsafe_store(offset1, acc10)
+            dst.unsafe_store(offset1 + W, acc11)
+            dst.unsafe_store(offset2, acc20)
+            dst.unsafe_store(offset2 + W, acc21)
+            dst.unsafe_store(offset3, acc30)
+            dst.unsafe_store(offset3 + W, acc31)
+            j += 2 * W
+        while j < cols:
+            var acc0 = dst[unsafe_offset=i * cols + j] if accumulate != 0 else 0.0
+            var acc1 = dst[unsafe_offset=(i + 1) * cols + j] if accumulate != 0 else 0.0
+            var acc2 = dst[unsafe_offset=(i + 2) * cols + j] if accumulate != 0 else 0.0
+            var acc3 = dst[unsafe_offset=(i + 3) * cols + j] if accumulate != 0 else 0.0
+            for k in range(inner):
+                var bv = b[unsafe_offset=k * cols + j]
+                acc0 += a[unsafe_offset=i * inner + k] * bv
+                acc1 += a[unsafe_offset=(i + 1) * inner + k] * bv
+                acc2 += a[unsafe_offset=(i + 2) * inner + k] * bv
+                acc3 += a[unsafe_offset=(i + 3) * inner + k] * bv
+            dst[unsafe_offset=i * cols + j] = acc0
+            dst[unsafe_offset=(i + 1) * cols + j] = acc1
+            dst[unsafe_offset=(i + 2) * cols + j] = acc2
+            dst[unsafe_offset=(i + 3) * cols + j] = acc3
+            j += 1
+        i += 4
+    while i < rows:
+        var j = 0
+        while j + 4 * W <= cols:
+            var dst_offset = i * cols + j
+            var acc0 = SIMD[DType.float64, W](0.0)
+            var acc1 = SIMD[DType.float64, W](0.0)
+            var acc2 = SIMD[DType.float64, W](0.0)
+            var acc3 = SIMD[DType.float64, W](0.0)
+            if accumulate != 0:
+                acc0 = dst.unsafe_load[width=W](dst_offset)
+                acc1 = dst.unsafe_load[width=W](dst_offset + W)
+                acc2 = dst.unsafe_load[width=W](dst_offset + 2 * W)
+                acc3 = dst.unsafe_load[width=W](dst_offset + 3 * W)
+            for k in range(inner):
+                var vv = SIMD[DType.float64, W](a[unsafe_offset=i * inner + k])
+                var b_offset = k * cols + j
+                acc0 += vv * b.unsafe_load[width=W](b_offset)
+                acc1 += vv * b.unsafe_load[width=W](b_offset + W)
+                acc2 += vv * b.unsafe_load[width=W](b_offset + 2 * W)
+                acc3 += vv * b.unsafe_load[width=W](b_offset + 3 * W)
+            dst.unsafe_store(dst_offset, acc0)
+            dst.unsafe_store(dst_offset + W, acc1)
+            dst.unsafe_store(dst_offset + 2 * W, acc2)
+            dst.unsafe_store(dst_offset + 3 * W, acc3)
+            j += 4 * W
+        while j + W <= cols:
+            var dst_offset = i * cols + j
+            var acc = SIMD[DType.float64, W](0.0)
+            if accumulate != 0:
+                acc = dst.unsafe_load[width=W](dst_offset)
+            for k in range(inner):
+                var vv = SIMD[DType.float64, W](a[unsafe_offset=i * inner + k])
+                acc += vv * b.unsafe_load[width=W](k * cols + j)
+            dst.unsafe_store(dst_offset, acc)
+            j += W
+        while j < cols:
+            var dst_offset = i * cols + j
+            var acc = dst[unsafe_offset=dst_offset] if accumulate != 0 else 0.0
+            for k in range(inner):
+                acc += a[unsafe_offset=i * inner + k] * b[unsafe_offset=k * cols + j]
+            dst[unsafe_offset=dst_offset] = acc
+            j += 1
+        i += 1
 
 
 def gpu_matmul_kernel(

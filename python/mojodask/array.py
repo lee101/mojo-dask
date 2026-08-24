@@ -12,6 +12,7 @@ from . import _lib
 from .core import Scalar, Task, execute, merge_graphs, new_key
 
 _PARALLEL_REDUCTION_SIZE = 1_000_000
+_PARALLEL_MATMUL_FLOPS = 8_000_000
 
 
 def _require_float64_dtype(dtype):
@@ -77,7 +78,17 @@ def _block_indices(chunks):
 class Array:
     __array_priority__ = 1000
 
-    def __init__(self, graph, blocks, shape, chunks, name=None, block_expressions=None):
+    def __init__(
+        self,
+        graph,
+        blocks,
+        shape,
+        chunks,
+        name=None,
+        block_expressions=None,
+        assembled_key=None,
+        whole_expression=None,
+    ):
         self._graph = graph
         self._blocks = dict(blocks)
         self.shape = tuple(shape)
@@ -86,14 +97,18 @@ class Array:
         self.dtype = np.dtype("float64")
         self.name = name or new_key("array")
         self._block_expressions = block_expressions or {}
-        self._key = new_key("assemble")
-        indices = _block_indices(self.chunks)
-        dependencies = tuple(self._blocks[index] for index in indices)
-        self._graph[self._key] = Task(
-            lambda *values, shape=self.shape, chunks=self.chunks, indices=indices:
-                _assemble(shape, chunks, indices, *values),
-            dependencies,
-        )
+        self._whole_expression = whole_expression
+        if assembled_key is None:
+            self._key = new_key("assemble")
+            indices = _block_indices(self.chunks)
+            dependencies = tuple(self._blocks[index] for index in indices)
+            self._graph[self._key] = Task(
+                lambda *values, shape=self.shape, chunks=self.chunks, indices=indices:
+                    _assemble(shape, chunks, indices, *values),
+                dependencies,
+            )
+        else:
+            self._key = assembled_key
 
     @property
     def numblocks(self):
@@ -162,22 +177,40 @@ class Array:
     def _binary(self, other, opcode):
         if np.isscalar(other):
             graph = dict(self._graph)
-            blocks = {}
-            expressions = {}
-            for index, dependency in self._blocks.items():
-                key = new_key("scalar-op")
-                value = other
-                graph[key] = Task(
-                    lambda block, value=value, opcode=opcode:
-                        _lib.scalar(block, value, opcode),
-                    (dependency,),
+            value = other
+            if self.ndim == 1 and len(self._blocks) > 1 and self.size >= 1_000_000:
+                blocks = {}
+                expressions = {}
+                for index, dependency in self._blocks.items():
+                    key = new_key("scalar-op")
+                    graph[key] = Task(
+                        lambda block, value=value, opcode=opcode:
+                            _lib.scalar(block, value, opcode),
+                        (dependency,),
+                    )
+                    blocks[index] = key
+                    if opcode < 4:
+                        expressions[index] = (dependency, value, opcode)
+                return Array(
+                    graph,
+                    blocks,
+                    self.shape,
+                    self.chunks,
+                    block_expressions=expressions,
                 )
-                blocks[index] = key
-                if opcode < 4:
-                    expressions[index] = (dependency, value, opcode)
-            return Array(
-                graph, blocks, self.shape, self.chunks,
-                block_expressions=expressions,
+            key = new_key("scalar-op-whole")
+            graph[key] = Task(
+                lambda whole, value=value, opcode=opcode:
+                    _lib.scalar(whole, value, opcode),
+                (self._key,),
+            )
+            expression = (self._key, value, opcode) if opcode < 4 else None
+            return _from_whole_task(
+                graph,
+                key,
+                self.shape,
+                self.chunks,
+                whole_expression=expression,
             )
         other = asarray(other, chunks=self.chunks)
         if self.shape != other.shape:
@@ -185,6 +218,67 @@ class Array:
         if self.chunks != other.chunks:
             other = other.rechunk(self.chunks)
         graph = merge_graphs(self._graph, other._graph)
+        whole_expression = self._whole_expression
+        if whole_expression is not None and opcode < 4:
+            source, value, scalar_opcode = whole_expression
+            key = new_key("fused-op-whole")
+            graph[key] = Task(
+                lambda left, right, value=value, scalar_opcode=scalar_opcode,
+                       opcode=opcode:
+                    _lib.scalar_binary(left, right, value, scalar_opcode, opcode),
+                (source, other._key),
+            )
+            return _from_whole_task(graph, key, self.shape, self.chunks)
+        if (
+            self.ndim == 1
+            and len(self._blocks) > 1
+            and self.size >= 1_000_000
+            and all(index in self._block_expressions for index in self._blocks)
+            and opcode < 4
+        ):
+            output_key = new_key("fused-output")
+            graph[output_key] = Task(
+                lambda shape=self.shape: np.empty(shape, dtype=np.float64)
+            )
+            blocks = {}
+            slices = _slices(self.chunks)[0]
+            for index in self._blocks:
+                source, value, scalar_opcode = self._block_expressions[index]
+                selection = slices[index[0]]
+                key = new_key("fused-write")
+
+                def write_block(
+                    left,
+                    right,
+                    output,
+                    selection=selection,
+                    value=value,
+                    scalar_opcode=scalar_opcode,
+                    opcode=opcode,
+                ):
+                    result = output[selection]
+                    _lib.scalar_binary_into(
+                        result, left, right, value, scalar_opcode, opcode
+                    )
+                    return result
+
+                graph[key] = Task(
+                    write_block,
+                    (source, other._blocks[index], output_key),
+                )
+                blocks[index] = key
+            complete_key = new_key("fused-complete")
+            graph[complete_key] = Task(
+                lambda output, *written: output,
+                (output_key, *blocks.values()),
+            )
+            return Array(
+                graph,
+                blocks,
+                self.shape,
+                self.chunks,
+                assembled_key=complete_key,
+            )
         blocks = {}
         for index in self._blocks:
             key = new_key("binary-op")
@@ -437,18 +531,12 @@ def from_array(x, chunks="auto", name=None, lock=False, asarray=None, fancy=True
     source = np.asarray(x)
     shape = source.shape
     normal = _normalise_chunks(shape, chunks)
-    slices = _slices(normal)
     graph = {}
-    blocks = {}
-    for index in _block_indices(normal):
-        selection = tuple(slices[axis][part] for axis, part in enumerate(index))
-        key = new_key(name or "from-array")
-        graph[key] = Task(
-            lambda source=source, selection=selection:
-                _lib.f64(source[selection], name="array input")
-        )
-        blocks[index] = key
-    return Array(graph, blocks, shape, normal, name)
+    key = new_key(name or "from-array-whole")
+    graph[key] = Task(
+        lambda source=source: _lib.f64(source, name="array input")
+    )
+    return _from_whole_task(graph, key, shape, normal, name=name)
 
 
 def asarray(a, allow_unknown_chunksizes=False, dtype=None, order=None, like=None,
@@ -555,27 +643,63 @@ def matmul(a, b, device="cpu"):
         right = right.rechunk((left.chunks[1], right.chunks[1]))
     chunks = (left.chunks[0], right.chunks[1])
     graph = merge_graphs(left._graph, right._graph)
+    if 2 * left.shape[0] * left.shape[1] * right.shape[1] < _PARALLEL_MATMUL_FLOPS:
+        key = new_key("matmul-serial")
+        graph[key] = Task(
+            lambda left_value, right_value: _lib.matmul(left_value, right_value),
+            (left._key, right._key),
+        )
+        return _from_whole_task(
+            graph, key, (left.shape[0], right.shape[1]), chunks
+        )
     blocks = {}
     for i in range(len(chunks[0])):
         for j in range(len(chunks[1])):
-            dependencies = []
+            products = []
             for k in range(len(left.chunks[1])):
-                dependencies.extend(
-                    (left._blocks[(i, k)], right._blocks[(k, j)])
+                product_key = new_key("matmul-product")
+                graph[product_key] = Task(
+                    lambda left_value, right_value:
+                        _lib.matmul(left_value, right_value),
+                    (left._blocks[(i, k)], right._blocks[(k, j)]),
                 )
+                products.append(product_key)
             key = new_key("matmul")
 
-            def multiply_parts(*values):
-                result = _lib.matmul(values[0], values[1])
-                for part in range(2, len(values), 2):
-                    _lib.matmul_accumulate(
-                        result, values[part], values[part + 1]
-                    )
+            def accumulate_parts(*values):
+                result = values[0]
+                for value in values[1:]:
+                    _lib.add_inplace(result, value)
                 return result
 
-            graph[key] = Task(multiply_parts, tuple(dependencies))
+            graph[key] = Task(accumulate_parts, tuple(products))
             blocks[(i, j)] = key
     return Array(graph, blocks, (left.shape[0], right.shape[1]), chunks)
+
+
+def _from_whole_task(
+    graph, key, shape, chunks, name=None, whole_expression=None
+):
+    slices = _slices(chunks)
+    blocks = {}
+    for index in _block_indices(chunks):
+        selection = tuple(slices[axis][part] for axis, part in enumerate(index))
+        block_key = new_key("whole-block")
+        graph[block_key] = Task(
+            lambda whole, selection=selection:
+                _lib.f64(whole[selection], name="array block"),
+            (key,),
+        )
+        blocks[index] = block_key
+    return Array(
+        graph,
+        blocks,
+        shape,
+        chunks,
+        name=name,
+        assembled_key=key,
+        whole_expression=whole_expression,
+    )
 
 
 def concatenate(seq, axis=0, allow_unknown_chunksizes=False):

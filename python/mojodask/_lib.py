@@ -5,7 +5,7 @@ from __future__ import annotations
 import ctypes
 import os
 import subprocess
-import warnings
+import time
 
 import numpy as np
 
@@ -22,6 +22,7 @@ _SIGNATURES = {
     "md_stats": ([I, I, I], None),
     "md_sum": ([I, I], F),
     "md_dot": ([I, I, I], F),
+    "md_add_inplace": ([I, I, I], None),
     "md_matmul": ([I, I, I, I, I, I, I], None),
     "md_matmul_gpu": ([I, I, I, I, I, I], I),
     "md_group_stats": ([I] * 10, None),
@@ -29,6 +30,7 @@ _SIGNATURES = {
 
 _library: ctypes.CDLL | None = None
 _MAX_EXACT_INTEGER = 1 << 53
+_gpu_memory_cache: tuple[float, int | None] | None = None
 
 
 def build() -> str:
@@ -81,6 +83,30 @@ def addr(value: np.ndarray) -> int:
     return address
 
 
+def _gpu_memory_free_mib() -> int | None:
+    global _gpu_memory_cache
+    now = time.monotonic()
+    if _gpu_memory_cache is not None and now - _gpu_memory_cache[0] < 1.0:
+        return _gpu_memory_cache[1]
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        free_mib = min(int(line.strip()) for line in result.stdout.splitlines())
+    except (FileNotFoundError, subprocess.SubprocessError, ValueError):
+        free_mib = None
+    _gpu_memory_cache = (now, free_mib)
+    return free_mib
+
+
 def _same_size(left: np.ndarray, right: np.ndarray) -> None:
     if left.size != right.size:
         raise ValueError("kernel operands must have the same number of elements")
@@ -128,6 +154,28 @@ def scalar_binary(
     return result
 
 
+def scalar_binary_into(
+    result: np.ndarray,
+    a: np.ndarray,
+    b: np.ndarray,
+    value: float,
+    scalar_op: int,
+    binary_op: int,
+) -> None:
+    destination = f64(result, name="destination")
+    if destination is not result:
+        raise ValueError("fused output must be a contiguous float64 array")
+    left, right = f64(a, name="left operand"), f64(b, name="right operand")
+    _same_size(destination, left)
+    _same_size(left, right)
+    scalar_value = f64(np.asarray(value), name="scalar").item()
+    if destination.size:
+        lib().md_scalar_binary(
+            addr(left), addr(right), scalar_value, addr(destination),
+            destination.size, scalar_op, binary_op,
+        )
+
+
 def unary(a: np.ndarray, op: int) -> np.ndarray:
     if op not in range(5):
         raise ValueError("invalid unary kernel operation")
@@ -163,6 +211,15 @@ def dot(a: np.ndarray, b: np.ndarray) -> float:
     return float(lib().md_dot(addr(left), addr(right), left.size))
 
 
+def add_inplace(result: np.ndarray, value: np.ndarray) -> None:
+    destination, source = f64(result), f64(value)
+    if destination is not result:
+        raise ValueError("in-place addition requires a contiguous float64 result")
+    _same_size(destination, source)
+    if destination.size:
+        lib().md_add_inplace(addr(destination), addr(source), destination.size)
+
+
 def matmul(a: np.ndarray, b: np.ndarray, device: str = "cpu") -> np.ndarray:
     left, right = f64(a, name="left matrix"), f64(b, name="right matrix")
     if left.ndim != 2 or right.ndim != 2:
@@ -177,16 +234,17 @@ def matmul(a: np.ndarray, b: np.ndarray, device: str = "cpu") -> np.ndarray:
         return result
     if device == "gpu":
         device_bytes = left.nbytes + right.nbytes + result.nbytes
-        if device_bytes < 2_000_000_000 and lib().md_matmul_gpu(
-            addr(left), addr(right), addr(result),
-            left.shape[0], left.shape[1], right.shape[1],
+        free_mib = _gpu_memory_free_mib()
+        if (
+            free_mib is not None
+            and free_mib >= 4000
+            and device_bytes < 2_000_000_000
+            and lib().md_matmul_gpu(
+                addr(left), addr(right), addr(result),
+                left.shape[0], left.shape[1], right.shape[1],
+            )
         ):
             return result
-        warnings.warn(
-            "GPU matmul was unavailable; falling back to the CPU kernel",
-            RuntimeWarning,
-            stacklevel=2,
-        )
     lib().md_matmul(
         addr(left), addr(right), addr(result),
         left.shape[0], left.shape[1], right.shape[1], 0,
