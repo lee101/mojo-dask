@@ -1,7 +1,7 @@
 """Numerical kernels for blocked arrays and dataframe aggregations."""
 
 from std.math import abs, exp, log, pow, sqrt
-from std.gpu import block_dim, block_idx, thread_idx
+from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext
 from std.sys.info import simd_width_of
 

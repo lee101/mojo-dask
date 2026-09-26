@@ -163,7 +163,7 @@ Dataframe partitions factorize group keys in Python, aggregate numeric columns b
 integer code in Mojo, then merge the same Welford states across partition boundaries.
 That last merge is what makes variance and standard deviation correct when a group
 spans many partitions. High-arithmetic-intensity matrix multiplication also has an
-explicit `std.gpu` path; streaming elementwise and reduction kernels stay on CPU because
+explicit `max.gpu` path; streaming elementwise and reduction kernels stay on CPU because
 their arithmetic intensity is too low to repay device transfers.
 
 ## Verification
